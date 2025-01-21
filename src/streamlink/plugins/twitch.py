@@ -265,19 +265,15 @@ class TwitchHLSStream(HLSStream):
         supported_codecs = kwargs.pop("supported_codecs", [])
         streams = super().parse_variant_playlist(session, url, **kwargs)
 
-        remux = supported_codecs != ["h264"] and FFMPEGMuxer.is_usable(session)
+        need_remux = set(supported_codecs) - {"h264"} and FFMPEGMuxer.is_usable(session)
 
         res = {}
         for name, stream in streams.items():
-            # digustingly dirty hack: read codec info like that until the whole stream selection has been rewritten
-            codecs = next((pl.stream_info.codecs for pl in stream.multivariant.playlists if pl.uri == stream.url), None)
-            if (
-                not remux
-                or not codecs
-                or not any(codec.split(".", 1)[0] in cls.CODECS_REMUX for codec in codecs)
-            ):  # fmt: skip
-                res[name] = stream
-            else:
+            # disgustingly dirty hack: read codec info like that until the whole stream selection has been rewritten
+            pl_matched_gen = (pl.stream_info.codecs for pl in stream.multivariant.playlists if pl.uri == stream.url)
+            codecs = next(pl_matched_gen, None)
+            weird_codes = any(codec.split(".", 1)[0] in cls.CODECS_REMUX for codec in codecs)
+            if need_remux and weird_codes:
                 res[name] = MuxedHLSStream(
                     session,
                     video=stream.url,
@@ -286,6 +282,8 @@ class TwitchHLSStream(HLSStream):
                     multivariant=stream.multivariant,
                     **kwargs,
                 )
+            else:
+                res[name] = stream
 
         return res
 
@@ -293,7 +291,7 @@ class TwitchHLSStream(HLSStream):
 class UsherService:
     def __init__(self, session: Streamlink, supported_codecs: list[str] | None = None):
         self.session = session
-        self.supported_codecs = supported_codecs or ["h264"]
+        self.supported_codecs = supported_codecs
 
     def _create_url(self, endpoint, **extra_params):
         url = f"https://usher.ttvnw.net{endpoint}"
@@ -306,8 +304,10 @@ class UsherService:
             "allow_audio_only": "true",
             "allow_spectre": "false",
             "playlist_include_framerate": "true",
-            "supported_codecs": ",".join(self.supported_codecs),
         }
+        if self.supported_codecs:
+            params["supported_codecs"] = ",".join(self.supported_codecs)
+
         params.update(extra_params)
 
         req = self.session.http.prepare_new_request(url=url, params=params)
@@ -790,17 +790,15 @@ class TwitchClientIntegrity:
     "supported-codecs",
     type="comma_list_filter",
     type_kwargs={
-        "acceptable": ["h264", "h265", "av1"],
+        "acceptable": ["av1", "h265", "h264", "mp4a", "265", "264", "avc1", "hevc", "audio", "aac"],
         "unique": True,
     },
-    default=["h264"],
+    default=[],
     help="""
         A comma-separated list of codec names which signals Twitch the client's stream codec preference.
         Which streams and which codecs are available depends on the specific channel and broadcast.
 
-        Default is "h264".
-
-        Supported codecs are "h264", "h265", "av1". Set to "h264,h265,av1" to enable all codecs.
+        Supported codecs are "h264", "h265", "av1", and "mp4a" for audio-only.
     """,
 )
 @pluginargument(
