@@ -17,13 +17,15 @@ $notes Acquires a :ref:`client-integrity token <cli/plugins/twitch:Client-integr
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import sys
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace as dataclass_replace
-from datetime import timedelta
+from datetime import datetime, timedelta
+import functools
 from json import dumps as json_dumps
 from random import random
 from typing import TYPE_CHECKING, ClassVar
@@ -66,6 +68,19 @@ if TYPE_CHECKING:
 log = getLogger(__name__)
 
 LOW_LATENCY_MAX_LIVE_EDGE = 2
+
+
+def run_once_hook(hook_name):
+    def decorator(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            flag = f"__{hook_name}_done"
+            if not getattr(self, flag, False):
+                getattr(self, hook_name)()
+                setattr(self, flag, True)
+            return method(self, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 @dataclass(kw_only=True)
@@ -139,6 +154,12 @@ class TwitchM3U8Parser(M3U8Parser[TwitchM3U8, TwitchHLSSegment, HLSPlaylist]):
             self.m3u8.dateranges_ads.append(daterange)
             log.trace("Advertisement: %r", daterange)
 
+    @parse_tag("EXT-X-TWITCH-INFO")
+    def parse_tag_ext_x_twitch_info(self, value):
+        pairs = value.split(',')
+        kv_pairs = [pair.split('=') for pair in pairs]
+        self.m3u8.twitch_info = {k: v.strip('"') for k, v in kv_pairs}
+
     def get_segment(self, uri: str, **data) -> TwitchHLSSegment:
         ad = self._is_segment_ad(self._date, self._extinf.title if self._extinf else None)
         segment: TwitchHLSSegment = super().get_segment(uri, ad=ad, prefetch=False)  # type: ignore[assignment, ty:invalid-assignment]
@@ -202,7 +223,8 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
         if self.stream.low_latency:
             self.reload_time = "segment"
 
-    def process_segments(self, playlist: TwitchM3U8):  # type: ignore[override, ty:invalid-method-override]
+    # noinspection PyMethodOverriding
+    def process_segments(self, playlist: TwitchM3U8) -> None:
         # ignore prefetch segments if not LL streaming
         if not self.stream.low_latency:
             playlist.segments = [segment for segment in playlist.segments if not segment.prefetch]
@@ -251,13 +273,14 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
 
             log.info(f"Detected advertisement break of {duration} second{'s' if duration != 1 else ''}")
 
-        return super().process_segments(playlist)
+        super().process_segments(playlist)
 
 
 class TwitchHLSStreamWriter(HLSStreamWriter):
     reader: TwitchHLSStreamReader
     stream: TwitchHLSStream
 
+    # noinspection PyMethodOverriding
     def should_filter_segment(self, segment: TwitchHLSSegment) -> bool:  # type: ignore[override, ty:invalid-method-override]
         return segment.ad
 
@@ -328,14 +351,57 @@ class UsherService:
             ).validate(extra_params)
             log.debug("%r", extra_params_debug)
 
-        return self._create_url(f"/api/v2/channel/hls/{channel.lower()}.m3u8", **extra_params)
+        return self._create_url(f"/api/v2/channel/hls/{channel.lower()}.m3u8", **extra_params) or ''
 
     def video(self, video_id: str, **extra_params) -> str:
-        return self._create_url(f"/vod/v2/{video_id}.m3u8", **extra_params)
+        return self._create_url(f"/vod/v2/{video_id}.m3u8", **extra_params) or ''
 
 
 class TwitchAPI:
     CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+
+    USER_SCHEMA = {
+        "id": str,
+        "primaryColorHex": str | None,
+        "roles": {
+            "isPartner": bool,
+            "isParticipatingDJ": bool,
+            "__typename": "UserRoles"
+        },
+        "profileImageURL": str,
+        "primaryTeam": dict | str | None,
+        validate.optional("squadStream"): str | None,
+        "channel": {"id": str, validate.optional("chanlets"): str | None, "__typename": "Channel"},
+        "lastBroadcast": {"id": str, "title": str | None, "__typename": "Broadcast"},
+        "stream": validate.none_or_all({
+            "id": str,
+            "type": str,
+            "createdAt": str,
+            validate.optional("viewersCount"): int,
+            "game": validate.none_or_all({"id": str, "name": str, "__typename": "Game"}),
+            "__typename": "Stream",
+        }),
+        "__typename": "User",
+    }
+
+    VIDEO_SCHEMA = {
+        validate.optional("animatedPreviewURL"): str | None,
+        "game": validate.none_or_all({"id": str, "boxArtURL": str, "name": str, "displayName": str, "__typename": "Game"}),
+        "id": str,
+        "lengthSeconds": int,
+        "owner": {"id": str, "login": str, "displayName": str, "__typename": "User"},
+        "previewThumbnailURL": str,
+        validate.optional("publishedAt"): str,
+        # self: {}
+        "title": str | None,
+        validate.optional("description"): str | None,
+        validate.optional("createdAt"): str,
+        "viewCount": int,
+        validate.optional("resourceRestriction"): str | None,
+        validate.optional("broadcastType"): str | None,
+        validate.optional("contentTags"): [str],
+        "__typename": "Video",
+    }
 
     def __init__(self, session, api_header=None, access_token_param=None):
         self.session = session
@@ -346,21 +412,23 @@ class TwitchAPI:
         self.access_token_params = dict(access_token_param or [])
         self.access_token_params.setdefault("playerType", "embed")
         self.access_token_params.setdefault("platform", "site")
+        self.metadata_cache = {}
 
-    def call(self, data, /, *, headers=None, schema, **kwargs):
-        return self.session.http.post(
-            "https://gql.twitch.tv/gql",
-            json=data,
-            headers={
-                **self.headers,
-                **(headers or {}),
-            },
-            schema=validate.Schema(
-                validate.parse_json(),
-                schema,
-            ),
-            **kwargs,
-        )
+    @staticmethod
+    def _compile_schema(schema):
+        if not isinstance(schema, validate.Schema):
+            schema = validate.Schema(validate.parse_json(), schema)
+        return schema
+
+    def gql_call(self, gquery, /, *, headers=None, schema=None, **kwargs):
+        kwargs['headers'] = {**self.headers}
+        if headers:
+            kwargs['headers'].update(headers)
+        if schema:
+            schema = self._compile_schema(schema)
+            kwargs['schema'] = schema
+
+        return self.session.http.post("https://gql.twitch.tv/gql", json=gquery, **kwargs)
 
     @staticmethod
     def _gql_persisted_query(operationname, sha256hash, **variables):
@@ -368,8 +436,8 @@ class TwitchAPI:
             "operationName": operationname,
             "extensions": {
                 "persistedQuery": {
-                    "version": 1,
                     "sha256Hash": sha256hash,
+                    "version": 1,
                 },
             },
             "variables": dict(**variables),
@@ -394,125 +462,154 @@ class TwitchAPI:
 
     # GraphQL API calls
 
-    def metadata_video(self, video_id):
-        query = self._gql_persisted_query(
-            "VideoMetadata",
-            "45111672eea2e507f8ba44d101a61862f9c56b11dee09a15634cb75cb9b9084d",
-            channelLogin="",  # parameter can be empty
-            videoID=video_id,
-        )
-
-        return self.call(
-            query,
-            schema=validate.all(
-                {
-                    "data": {
-                        "video": {
-                            "id": str,
-                            "owner": {
-                                "displayName": str,
+    queries = {
+        "live": {
+            "gql": lambda channel: [
+                TwitchAPI._gql_persisted_query(
+                    "StreamMetadata",
+                    "b57f9b910f8cd1a4659d894fe7550ccc81ec9052c01e438b290fd66a040b9b93",
+                    channelLogin=channel,
+                    includeIsDJ=True,
+                ),
+                TwitchAPI._gql_persisted_query(
+                    "FilterableVideoTower_Videos",
+                    "67004f7881e65c297936f32c75246470629557a393788fb5a69d6d9a25a8fd5f",
+                    broadcastType=None,
+                    channelOwnerLogin=channel,
+                    includePreviewBlur=False,
+                    limit=1,
+                    videoSort="TIME",
+                ),
+            ],
+            "schema": validate.all(
+                validate.union_get((0, "data", "user"), (1, "data", "user", "videos", "edges", 0)),
+                validate.transform(lambda data: (data[0], (data[1] or {"node": None})["node"])),
+                validate.all(
+                    (USER_SCHEMA, validate.none_or_all(validate.all(VIDEO_SCHEMA))),
+                    validate.transform(
+                        lambda data: data
+                        and data[0]
+                        | {
+                            "id": (data[0]["stream"] or {"id": ""})["id"],
+                            "author": data[1] and data[1]["owner"]["displayName"],
+                            "category": (
+                                val if (val := data[0]["stream"]) and data[0]["stream"]["game"] else {"game": {"name": ""}}
+                            )["game"]["name"],
+                            "title": data[0]["lastBroadcast"]["title"],
+                            "last_vod": data[1]
+                            and {
+                                "url": f"https://www.twitch.tv/videos/{data[1]['id']}",
                             },
-                            "title": str,
-                            "game": {
-                                "displayName": str,
-                            },
-                        },
-                    },
-                },
-                validate.get(("data", "video")),
-                validate.union_get(
-                    "id",
-                    ("owner", "displayName"),
-                    ("game", "displayName"),
-                    "title",
+                        }
+                    ),
                 ),
             ),
-        )
-
-    def metadata_channel(self, channel):
-        queries = [
-            self._gql_persisted_query(
-                "ChannelShell",
-                "fea4573a7bf2644f5b3f2cbbdcbee0d17312e48d2e55f080589d053aad353f11",
-                login=channel,
+        },
+        "vod": {
+            "gql": lambda video_id: [
+                TwitchAPI._gql_persisted_query(
+                    "VideoMetadata",
+                    "45111672eea2e507f8ba44d101a61862f9c56b11dee09a15634cb75cb9b9084d",
+                    channelLogin="",
+                    videoID=video_id,
+                )
+            ],
+            "schema": validate.all(
+                validate.get((0, "data", "video")),
+                VIDEO_SCHEMA,
+                validate.transform(
+                    lambda data: data
+                    | {
+                        "id": data["id"],
+                        "author": data["owner"]["displayName"],
+                        "category": (data["game"] or {"displayName": ""})["displayName"],
+                        "title": data["title"],
+                    }
+                ),
             ),
-            self._gql_persisted_query(
-                "StreamMetadata",
-                "b57f9b910f8cd1a4659d894fe7550ccc81ec9052c01e438b290fd66a040b9b93",
-                channelLogin=channel,
-                includeIsDJ=True,
-            ),
-        ]
-
-        return self.call(
-            queries,
-            schema=validate.all(
-                validate.list(
-                    {
-                        "data": {
-                            "userOrError": {
-                                "displayName": str,
-                            },
-                        },
-                    },
-                    {
-                        "data": {
-                            "user": {
-                                "lastBroadcast": {
+        },
+        "clip": {
+            "gql": lambda clipname: [
+                TwitchAPI._gql_persisted_query(
+                    "ShareClipRenderStatus",
+                    "1844261bb449fa51e6167040311da4a7a5f1c34fe71c71a3e0c4f551bc30c698",
+                    slug=clipname,
+                ),
+                TwitchAPI._gql_persisted_query(
+                    "ClipsTitle",
+                    "f6cca7f2fdfbfc2cecea0c88452500dae569191e58a265f97711f8f2a838f5b4",
+                    slug=clipname,
+                ),
+            ],
+            "schema": validate.all(
+                [
+                    validate.all(
+                        validate.get(("data", "clip")),
+                        {
+                            "data": {
+                                "clip": {
+                                    "id": str,
+                                    "broadcaster": {"displayName": str},
+                                    "game": {"name": str},
                                     "title": str,
                                 },
-                                "stream": {
-                                    "id": str,
-                                    "game": validate.none_or_all(
-                                        {"name": str},
-                                        validate.get("name"),
-                                    ),
-                                },
                             },
                         },
-                    },
-                ),
-                validate.union_get(
-                    (1, "data", "user", "stream", "id"),
-                    (0, "data", "userOrError", "displayName"),
-                    (1, "data", "user", "stream", "game"),
-                    (1, "data", "user", "lastBroadcast", "title"),
-                ),
-            ),
-        )
-
-    def metadata_clips(self, clipname):
-        query = self._gql_persisted_query(
-            "ShareClipRenderStatus",
-            "1844261bb449fa51e6167040311da4a7a5f1c34fe71c71a3e0c4f551bc30c698",
-            slug=clipname,
-        )
-
-        return self.call(
-            query,
-            schema=validate.all(
-                {
-                    "data": {
-                        "clip": {
-                            "id": str,
-                            "broadcaster": {"displayName": str},
-                            "game": {"name": str},
-                            "title": str,
-                        },
-                    },
-                },
-                validate.get(("data", "clip")),
-                validate.union_get(
-                    "id",
-                    ("broadcaster", "displayName"),
-                    ("game", "name"),
-                    "title",
+                    ),
+                    validate.all(
+                        validate.get(("data", "clip")),
+                        validate.union_get(
+                            "id",
+                            ("broadcaster", "displayName"),
+                            ("game", "name"),
+                            "title",
+                        ),
+                    ),
+                ],
+                validate.transform(
+                    lambda data: data
+                    | {
+                        "id": data[0]["id"],
+                        "author": data[0]["broadcaster"]["displayName"],
+                        "category": data[0]["game"]["name"],
+                        "title": data[1]["title"],
+                    }
                 ),
             ),
-        )
+        },
+    }
+
+    def metadata(self, media_type, media_id):
+        if self.metadata_cache[(media_type, media_id)]:
+            return self.metadata_cache[(media_type, media_id)]
+
+        query = self.queries[media_type]['gql'](media_id)
+        log.debug(f'GQL query: {query}')
+        schema = self.queries[media_type]['schema']
+
+        res = self.gql_call(query)
+        res_text = res.text
+        log.debug(f'GQL response: {res_text}')
+        schema_runner = self._compile_schema(schema)
+
+        try:
+            data = schema_runner.validate(res_text)
+        except PluginError as err:
+            data = {}
+
+            import traceback
+            log.error(f"Could not get metadata: {err}")
+            print(f"Could not get metadata: {err}")
+            st = ''.join(traceback.format_exception(err))
+            log.error(st)
+            print(f"stack:\n{st}")
+
+        return data
+
 
     def access_token(self, is_live, channel_or_vod, client_integrity: tuple[str, str] | None = None):
-        query = self._gql_persisted_query(
+        media_type = "live" if is_live else "vod"
+        token_query = self._gql_persisted_query(
             "PlaybackAccessToken",
             "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9",
             isLive=is_live,
@@ -521,54 +618,68 @@ class TwitchAPI:
             vodID=channel_or_vod if not is_live else "",
             **self.access_token_params,
         )
+
         subschema = validate.none_or_all(
-            {
-                "value": str,
-                "signature": str,
-            },
+            {"value": str, "signature": str, },
             validate.union_get("signature", "value"),
         )
-
-        headers = {
-            # https://github.com/streamlink/streamlink/issues/6574
-            "User-Agent": http_useragents.DEFAULT,
-        }
-        if client_integrity:
-            headers["Device-Id"], headers["Client-Integrity"] = client_integrity
-
-        return self.call(
-            query,
-            acceptable_status=(200, 400, 401, 403),
-            headers=headers,
-            schema=validate.any(
-                validate.all(
-                    {"errors": [{"message": str}]},
-                    validate.get(("errors", 0, "message")),
-                    validate.transform(lambda data: ("error", None, data)),
-                ),
-                validate.all(
-                    {"error": str, "message": str},
-                    validate.union_get("error", "message"),
-                    validate.transform(lambda data: ("error", *data)),
-                ),
-                validate.all(
-                    {
-                        "data": validate.any(
-                            validate.all(
-                                {"streamPlaybackAccessToken": subschema},
-                                validate.get("streamPlaybackAccessToken"),
-                            ),
-                            validate.all(
-                                {"videoPlaybackAccessToken": subschema},
-                                validate.get("videoPlaybackAccessToken"),
-                            ),
+        token_schema = validate.any(
+            validate.all(
+                {"errors": [{"message": str}]},
+                validate.get(("errors", 0, "message")),
+                validate.transform(lambda data: ("error", None, data)),
+            ),
+            validate.all(
+                {"error": str, "message": str},
+                validate.union_get("error", "message"),
+                validate.transform(lambda data: ("error", *data)),
+            ),
+            validate.all(
+                {
+                    "data": validate.any(
+                        validate.all(
+                            {"streamPlaybackAccessToken": subschema},
+                            validate.get("streamPlaybackAccessToken"),
                         ),
-                    },
-                    validate.get("data"),
-                    validate.transform(lambda data: ("token", *data) if data is not None else ("token", None, None)),
-                ),
+                        validate.all(
+                            {"videoPlaybackAccessToken": subschema},
+                            validate.get("videoPlaybackAccessToken"),
+                        ),
+                    ),
+                },
+                validate.get("data"),
+                validate.transform(lambda data: ("token", *data) if data is not None else ("token", None, None)),
             ),
         )
+        queries = (
+            token_query,
+            *self.queries[media_type]['gql'](channel_or_vod)
+        )
+        headers = {}
+        if client_integrity:
+            headers |= {
+                "Device-Id":  client_integrity,
+                "Client-Integrity": client_integrity,
+            }
+
+        log.debug(f'GQL query: %s', json.dumps(queries, indent=2))
+        res = self.gql_call(
+            queries,
+            acceptable_status=(200, 400, 401, 403),
+            headers=headers,
+        )
+        res_text = res.text
+        res_json = parse_json(res_text)
+        log.debug(f'GQL response %s', json.dumps(res_json, indent=2))
+
+        token_data = validate.validate(token_schema, res_json[0])
+        log.debug(f'Validated response: %s', json.dumps(token_data, indent=2))
+        metadata = validate.validate(self.queries[media_type]['schema'], res_json[1:])
+        log.debug(f'Validated response: %s', json.dumps(metadata, indent=2))
+        self.metadata_cache[(media_type, channel_or_vod)] = metadata
+
+        return token_data
+
 
     def clips(self, clipname):
         query = self._gql_persisted_query(
@@ -578,43 +689,40 @@ class TwitchAPI:
             platform="web",
         )
 
-        return self.call(
+        return self.gql_call(
             query,
             schema=validate.all(
                 {
                     "data": {
-                        "clip": validate.none_or_all(
-                            {
-                                "playbackAccessToken": {
-                                    "signature": str,
-                                    "value": str,
-                                },
-                                "videoQualities": validate.all(
-                                    [
-                                        {
-                                            "frameRate": validate.transform(int),
-                                            "quality": str,
-                                            "sourceURL": validate.any("", validate.url()),
-                                        },
-                                    ],
-                                    validate.filter(lambda clip: clip["sourceURL"]),
-                                    validate.map(
-                                        lambda clip: (
-                                            f"{clip['quality']}p{clip['frameRate']}",
-                                            clip["sourceURL"],
+                        "clip": {
+                            "playbackAccessToken": {
+                                "signature": str,
+                                "value": str,
+                            },
+                            "videoQualities": [
+                                validate.all(
+                                    {
+                                        "frameRate": validate.transform(int),
+                                        "quality": str,
+                                        "sourceURL": validate.url(),
+                                    },
+                                    validate.transform(
+                                        lambda q: (
+                                            f"{q['quality']}p{q['frameRate']}",
+                                            q["sourceURL"],
                                         ),
                                     ),
                                 ),
-                            },
-                            validate.union_get(
-                                ("playbackAccessToken", "signature"),
-                                ("playbackAccessToken", "value"),
-                                "videoQualities",
-                            ),
-                        ),
+                            ],
+                        },
                     },
                 },
                 validate.get(("data", "clip")),
+                validate.union_get(
+                    ("playbackAccessToken", "signature"),
+                    ("playbackAccessToken", "value"),
+                    "videoQualities",
+                ),
             ),
         )
 
@@ -830,6 +938,11 @@ class TwitchClientIntegrity:
     help="Purge cached Twitch client-integrity token and acquire a new one.",
 )
 class Twitch(Plugin):
+    media_type: str
+    media_id: str
+    video_id: str | None = None
+    time_offset: float = 0
+
     _CACHE_KEY_CLIENT_INTEGRITY = "client-integrity"
 
     api: TwitchAPI
@@ -843,12 +956,21 @@ class Twitch(Plugin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.metadata = {}
 
         params = parse_qsd(urlparse(self.url).query)
 
-        self.channel = self.match["channel"] if self.matches["live"] else None
-        self.video_id = self.match["video_id"] if self.matches["vod"] else None
-        self.clip_id = self.match["clip_id"] if self.matches["clip"] else None
+        if self.matches["live"]:
+            self.media_type = "live"
+            self.media_id = self.match["channel"]
+        elif self.matches["vod"]:
+            self.media_type = "vod"
+            self.media_id = self.match["video_id"]
+        elif self.matches["clip"]:
+            self.media_type = "clip"
+            self.media_id = self.match["clip_id"]
+        else:
+            raise PluginError("No media recognized")
 
         if self.matches["player"]:
             self.channel = params.get("channel")
@@ -869,33 +991,28 @@ class Twitch(Plugin):
             supported_codecs=self.get_option("supported-codecs"),
         )
 
-        self._checked_metadata = False
 
-        def method_factory(parent_method):
-            def inner():
-                if not self._checked_metadata:
-                    self._checked_metadata = True
-                    self._get_metadata()
-                return parent_method()
+    @run_once_hook("get_metadata")
+    def get_id(self):
+        return self.metadata.get('id')
 
-            return inner
+    @run_once_hook("get_metadata")
+    def get_author(self):
+        return self.metadata.get('author')
 
-        parent = super()
-        for metadata in "id", "author", "category", "title":
-            method = f"get_{metadata}"
-            setattr(self, method, method_factory(getattr(parent, method)))
+    @run_once_hook("get_metadata")
+    def get_category(self):
+        return self.metadata.get('category')
 
-    def _get_metadata(self):
-        with suppress(PluginError, TypeError):
-            if self.video_id:
-                data = self.api.metadata_video(self.video_id)
-            elif self.clip_id:
-                data = self.api.metadata_clips(self.clip_id)
-            elif self.channel:
-                data = self.api.metadata_channel(self.channel)
-            else:  # pragma: no cover
-                return
-            self.id, self.author, self.category, self.title = data
+    @run_once_hook("get_metadata")
+    def get_title(self):
+        return self.metadata.get('title')
+
+    def get_metadata(self) -> Mapping[str, str]:
+        if not self.metadata:
+            self.metadata = self.api.metadata(self.media_type, self.media_id)
+        return self.metadata
+
 
     def _client_integrity_token(self, channel: str) -> tuple[str, str] | None:
         if self.options.get("purge-client-integrity"):
@@ -965,7 +1082,8 @@ class Twitch(Plugin):
         sig, token, restricted_bitrates = self._access_token(True, channel)
         url = self.usher.channel(channel, sig=sig, token=token, fast_bread=True)
 
-        return self._get_hls_streams(url, restricted_bitrates)
+        ret = self._get_hls_streams(url, restricted_bitrates)
+        return ret
 
     def _get_hls_streams_video(self, video_id: str):
         log.debug(f"Getting HLS streams for video ID {self.video_id}")
@@ -1025,13 +1143,13 @@ class Twitch(Plugin):
             yield quality, HTTPStream(self.session, update_qsd(stream, {"sig": sig, "token": token}))
 
     def _get_streams(self):
-        if self.video_id:
-            return self._get_hls_streams_video(self.video_id)
-        elif self.clip_id:
-            return self._get_clips(self.clip_id)
-        elif self.channel:
-            return self._get_hls_streams_live(self.channel)
-        return None
-
+        ret = None
+        if self.media_type == 'vod':
+            ret = self._get_hls_streams_video(self.media_id)
+        elif self.media_type == 'clip':
+            ret = self._get_clips(self.media_id)
+        elif self.media_type == 'live':
+            ret = self._get_hls_streams_live(self.media_id)
+        return ret
 
 __plugin__ = Twitch

@@ -2,6 +2,7 @@
 # and instead of trying to get the version string from git, a static version string will be set
 
 
+
 def _get_version() -> str:
     """
     Get the current version from git in "editable" installs
@@ -9,10 +10,12 @@ def _get_version() -> str:
     # ruff: disable[import-outside-top-level, unsorted-imports]
     from pathlib import Path
     from versioningit import get_version
-    import streamlink
     # ruff: enable[import-outside-top-level, unsorted-imports]
-
-    return get_version(project_dir=Path(streamlink.__file__).parents[2])
+    try:
+        ret = get_version(project_dir=Path(__file__).parents[2])
+    except:
+        ret = "0.0.0"
+    return ret
 
 
 __version__ = _get_version()
