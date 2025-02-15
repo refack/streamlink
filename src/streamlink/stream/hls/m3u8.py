@@ -674,5 +674,6 @@ def parse_m3u8(
     """
     if base_uri is None and isinstance(data, Response):
         base_uri = data.url
-
-    return parser(base_uri).parse(data)
+    parser_instance = parser(base_uri)
+    ret = parser_instance.parse(data)
+    return ret
