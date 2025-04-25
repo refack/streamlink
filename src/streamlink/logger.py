@@ -254,30 +254,30 @@ def basicConfig(
     capture_warnings: bool = False,
 ) -> logging.StreamHandler | None:
     with _config_lock:
-        handler: logging.StreamHandler | None = None
-        if filename is not None:
-            handler = logging.FileHandler(filename, filemode, encoding="utf-8")
-        elif stream is not None:
-            handler = StreamHandler(stream)
-
-        if handler is not None:
-            formatter = StringFormatter(
-                fmt=format,
-                datefmt=datefmt,
-                style=style,
-                remove_base=remove_base or REMOVE_BASE,
-            )
-            handler.setFormatter(formatter)
-
-            root.addHandler(handler)
-
-        if level is not None:
-            root.setLevel(level)
-
         if capture_warnings:
             capturewarnings(True)
 
-    return handler
+        formatter = StringFormatter(
+            fmt=format,
+            datefmt=datefmt,
+            style=style,
+            remove_base=remove_base or REMOVE_BASE,
+        )
+        if level:
+            root.setLevel(logging.DEBUG)
+
+        if filename is not None:
+            handler = logging.FileHandler(filename, filemode, encoding="utf-8")
+            handler.setFormatter(formatter)
+            handler.setLevel(logging.NOTSET)
+            root.addHandler(handler)
+        if stream is not None:
+            handler = StreamHandler(stream)
+            handler.setFormatter(formatter)
+            if level is not None:
+                handler.setLevel(level)
+            root.addHandler(handler)
+            return handler
 
 
 _showwarning_default: Callable[[Warning | str, type[Warning], str, int, TextIO | None, str | None], None] | None = None
@@ -290,7 +290,7 @@ logging.setLogRecordFactory(_log_record_factory)
 # assuming of course that no one else has changed the logger-class on the manager or the global logging module value.
 logging.setLoggerClass(StreamlinkLogger)
 root: StreamlinkLogger = _get_child(logging.root, "streamlink")
-root.setLevel(WARNING)
+root.setLevel(logging.NOTSET)
 
 levels = list(_levelToNames.values())
 

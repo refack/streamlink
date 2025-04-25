@@ -649,6 +649,13 @@ def handle_url():
         raise StreamlinkCLIError() from err
 
     if not streams:
+        if args.json:
+            console.msg_json(
+                plugin=plugin.module,
+                metadata=plugin.get_metadata(),
+                streams=streams,
+            )
+            return
         raise StreamlinkCLIError(f"No playable streams found on this URL: {args.url}")
 
     if args.default_stream and not args.stream and not args.json:
@@ -923,8 +930,9 @@ def setup_console() -> None:
 
 
 def setup_logger() -> None:
-    level: str = args.loglevel if not args.silent_log else logging.getLevelName(logger.NONE)
-    file: str | None = args.logfile if level != logging.getLevelName(logger.NONE) else None
+    level: str = args.loglevel
+    silent_console: bool = bool(args.silent_log)
+    file: str | None = args.logfile
     fmt: str | None = args.logformat
     datefmt: str | None = args.logdateformat
 
@@ -957,7 +965,7 @@ def setup_logger() -> None:
             datefmt=datefmt,
             style="{",
             level=level,
-            stream=console.console_output,
+            stream=None if silent_console else console.console_output,
             capture_warnings=True,
         )
     except Exception as err:
@@ -984,7 +992,7 @@ def setup(parser: ArgumentParser) -> None:
     setup_config_args(parser)
 
     # update the logging level if changed by a plugin specific config
-    logger.root.setLevel(args.loglevel if not args.silent_log else logger.NONE)
+    # logger.root.setLevel(args.loglevel if not args.silent_log else logger.NONE)
 
     log_root_warning()
     log_current_versions()
@@ -1038,7 +1046,8 @@ def main():
         exit_code = err.code
         if msg := str(err):  # pragma: no branch
             if console.json:
-                console.msg_json({"error": msg})
+                msg_lines = msg.split("\n")
+                console.msg_json({"error": msg_lines})
             else:
                 console.msg(f"error: {msg}")
 
