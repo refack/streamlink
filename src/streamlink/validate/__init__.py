@@ -44,3 +44,5 @@ from streamlink.validate._validators import (
     validator_xml_xpath as xml_xpath,
     validator_xml_xpath_string as xml_xpath_string,
 )
+
+from streamlink.validate._exception import ValidationError

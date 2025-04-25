@@ -5,6 +5,7 @@ from copy import copy, deepcopy
 from functools import singledispatch
 from re import Pattern
 from typing import Any
+from types import UnionType
 
 from lxml.etree import Element, iselement
 
@@ -39,7 +40,7 @@ class Schema(AllSchema):
         try:
             return validate(self, value)
         except ValidationError as err:
-            raise exception(f"Unable to validate {name}: {err}") from None
+            raise exception(f"Unable to validate {name}: {err}") from err
 
 
 # ----
@@ -64,12 +65,17 @@ def _validate_type(schema: type, value):
         raise ValidationError(
             "Type of {value} should be {expected}, but is {actual}",
             value=repr(value),
-            expected=schema.__name__,
+            expected=getattr(schema, '__name__', repr(schema)),
             actual=type(value).__name__,
             schema=type,
         )
 
     return value
+
+
+@validate.register
+def _validate_union(schema: UnionType, value):
+    return _validate_type(schema, value)
 
 
 # singledispatch doesn't support typing.Union/types.UnionType on py<311, so keep each register() call for now
@@ -88,7 +94,16 @@ def _validate_sequence(schema: list | tuple | set | frozenset, value):
 @validate.register
 def _validate_dict(schema: dict, value):
     cls = type(schema)
-    validate(cls, value)
+    try:
+        validate(cls, value)
+    except ValidationError as ein:
+        raise ValidationError(
+            f"Type of {value} should be dict, but is {type(value).__name__} - {schema}",
+            ein,
+            value=repr(value),
+            actual=type(value).__name__,
+            schema=dict,
+        )
     new = cls()
 
     for key, subschema in schema.items():
@@ -112,14 +127,16 @@ def _validate_dict(schema: dict, value):
 
         if key not in value:
             raise ValidationError(
-                "Key {key} not found in {value}",
+                "Key {key} not found in {value} - {subschema}",
                 key=repr(key),
                 value=repr(value),
+                subschema=subschema,
                 schema=dict,
             )
 
         try:
-            new[key] = validate(subschema, value[key])
+            subvalue = value[key]
+            new[key] = validate(subschema, subvalue)
         except ValidationError as err:
             raise ValidationError("Unable to validate value of key {key}", key=repr(key), schema=dict) from err
 
