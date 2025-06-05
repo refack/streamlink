@@ -21,35 +21,38 @@ CONFIG_FILES: list[Path]
 PLUGIN_DIRS: list[Path]
 LOG_DIR: Path
 
+xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+xdg_data_home = os.environ.get("XDG_DATA_HOME")
+xdg_state_home = os.environ.get("XDG_STATE_HOME")
 if is_win32:
-    APPDATA = Path(os.environ.get("APPDATA") or Path.home() / "AppData")
+    win_app_data = Path(xdg_config_home or os.environ.get("APPDATA") or Path.home() / "AppData")
     CONFIG_FILES = [
-        APPDATA / "streamlink" / "config",
+        win_app_data / "streamlink" / "config",
     ]
     PLUGIN_DIRS = [
-        APPDATA / "streamlink" / "plugins",
+        win_app_data / "streamlink" / "plugins",
     ]
-    LOG_DIR = Path(tempfile.gettempdir()) / "streamlink" / "logs"
+    LOG_DIR = Path(xdg_state_home or os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "streamlink" / "logs"
 elif is_darwin:
-    XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+    darwin_config_home = Path(xdg_config_home or Path.home() / "Library" / "Application Support" / "streamlink")
     CONFIG_FILES = [
-        Path.home() / "Library" / "Application Support" / "streamlink" / "config",
+        darwin_config_home / "config",
     ]
     PLUGIN_DIRS = [
-        Path.home() / "Library" / "Application Support" / "streamlink" / "plugins",
+        darwin_config_home / "plugins",
     ]
-    LOG_DIR = Path.home() / "Library" / "Logs" / "streamlink"
+    LOG_DIR = Path(xdg_state_home or Path.home() / "Library" / "Logs") / "streamlink"
 else:
-    XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
-    XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser()
-    XDG_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    posix_config_home = Path(xdg_config_home or "~/.config").expanduser()
+    posix_data_home = Path(xdg_data_home or "~/.local/share").expanduser()
+    posix_state_home = Path(xdg_state_home or "~/.local/state").expanduser()
     CONFIG_FILES = [
-        XDG_CONFIG_HOME / "streamlink" / "config",
+        posix_config_home / "streamlink" / "config",
     ]
     PLUGIN_DIRS = [
-        XDG_DATA_HOME / "streamlink" / "plugins",
+        posix_data_home / "streamlink" / "plugins",
     ]
-    LOG_DIR = XDG_STATE_HOME / "streamlink" / "logs"
+    LOG_DIR = posix_state_home / "streamlink" / "logs"
 
 STREAM_SYNONYMS = ["best", "worst", "best-unfiltered", "worst-unfiltered"]
 STREAM_PASSTHROUGH = ["hls", "http"]
