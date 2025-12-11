@@ -80,6 +80,7 @@ decompress = [
   "urllib3[brotli,zstd] >=2.0.0,<3 ; python_version<'3.14'",
 ]
 
+
 [project.urls]
 Homepage = "https://github.com/streamlink/streamlink"
 Documentation = "https://streamlink.github.io/"
@@ -95,6 +96,7 @@ dev = [
   # or for reading the version string from git when building the documentation / man-pages
   "setuptools >=77.0.0",
   "versioningit >=2.0.0,<4",
+  "jsonpickle==5.0.0rc2",
 ]
 test = [
   { include-group = "dev" },
@@ -390,3 +392,8 @@ files = [
   "tests/",
   "setup.py",
 ]
+
+[tool.uv.extra-build-dependencies]
+streamlink = ["setuptools"]
+
+
