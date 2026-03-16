@@ -11,6 +11,7 @@ $metadata title
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, replace as dataclass_replace
 from ssl import OP_NO_TICKET
@@ -32,6 +33,7 @@ from streamlink.stream.hls import (
     M3U8Parser,
     parse_tag,
 )
+from streamlink.utils.parse import parse_json
 
 
 log = getLogger(__name__)
@@ -171,6 +173,7 @@ class Kick(Plugin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.metadata = {}
         self.session.http.mount("https://kick.com/", KickAdapter())
         self.session.http.headers.update(self.cache.get(self._CACHE_HEADERS, {}))
         self.session.http.headers.update({
@@ -240,7 +243,7 @@ class Kick(Plugin):
             "sec-fetch-user": "?1",
         }
 
-    def _query_api(self, url, schema, secondary_attempt=False):
+    def _just_query(self, url, secondary_attempt=False):
         res = self.session.http.get(
             url,
             headers=self._get_api_headers(),
@@ -248,15 +251,17 @@ class Kick(Plugin):
         )
         if res.status_code == 403 and not secondary_attempt and self._get_cookies_from_webbrowser():
             # re-attempt API query after getting (new) cookies
-            return self._query_api(url, schema, secondary_attempt=True)
+            return self._just_query(url, secondary_attempt=True)
 
         try:
             res.raise_for_status()
         except Exception as err:
             raise PluginError(f"Error while querying Kick API: {err or '403 status response'}") from err
+        return res.text
 
+    @staticmethod
+    def _just_schema(ret_json, schema):
         main_schema = validate.Schema(
-            validate.parse_json(),
             validate.any(
                 validate.all(
                     {"message": str},
@@ -272,66 +277,88 @@ class Kick(Plugin):
                 ),
             ),
         )
-        restype, data = main_schema.validate(res.text)
+        restype, data = main_schema.validate(ret_json)
 
         if restype == "error":
             raise PluginError(f"Error while querying Kick API: {data or 'unknown error'}")
         if not data:
             raise NoStreamsError
+        return data
 
+    def _query_api(self, url, schema, secondary_attempt=False):
+        ret_text = self._just_query(url, secondary_attempt=secondary_attempt)
+        ret_json = parse_json(ret_text)
+        log.debug(f'GQL response %s', json.dumps(ret_json, indent=2))
+        data = self._just_schema(ret_json, schema)
         return data
 
     def _get_streams_live(self):
         self.author = self.match["channel"]
 
-        hls_url, self.id, self.category, self.title = self._query_api(
-            self._URL_API_LIVESTREAM.format(channel=self.author),
-            schema=validate.Schema(
-                {
-                    "data": {
-                        "playback_url": validate.url(path=validate.endswith(".m3u8")),
-                        "id": int,
-                        "category": {"name": str},
-                        "session_title": str,
-                    },
+        schema = validate.Schema(
+            {
+                "data": {
+                    "playback_url": validate.url(path=validate.endswith(".m3u8")),
+                    "id": int,
+                    "category": {"name": str},
+                    "session_title": str,
+                    "created_at": str,
                 },
-                validate.get("data"),
-                validate.union_get(
-                    "playback_url",
-                    "id",
-                    ("category", "name"),
-                    "session_title",
-                ),
-            ),
+            },
+            validate.get("data"),
+            validate.transform(
+                lambda data: {
+                    "playback_url": data["playback_url"],
+                    "id": data["id"],
+                    "category": data["category"]["name"],
+                    "title": data["session_title"],
+                    "createdAt": data["created_at"],
+                }
+            )
         )
+        res_text = self._just_query(self._URL_API_LIVESTREAM.format(channel=self.author))
+        res_json = parse_json(res_text)
+        self.metadata = schema.validate(res_json)
+
+        hls_url = self.metadata["playback_url"]
+        self.id = self.metadata["id"]
+        self.category = self.metadata["category"]
+        self.title = self.metadata["title"]
 
         return KickHLSStream.parse_variant_playlist(self.session, hls_url, low_latency=self.get_option("low-latency"))
 
     def _get_streams_vod(self):
         self.id = self.match["vod"]
 
-        hls_url, self.author, self.title = self._query_api(
-            self._URL_API_VOD.format(vod=self.id),
-            schema=validate.Schema(
-                {
-                    "source": validate.url(path=validate.endswith(".m3u8")),
-                    "livestream": {
-                        "session_title": str,
-                        "channel": {
-                            "user": {
-                                "username": str,
-                            },
+        schema = validate.Schema(
+            {
+                "source": validate.url(path=validate.endswith(".m3u8")),
+                "livestream": {
+                    "session_title": str,
+                    "created_at": str,
+                    "channel": {
+                        "user": {
+                            "username": str,
                         },
                     },
                 },
-                validate.union_get(
-                    "source",
-                    ("livestream", "channel", "user", "username"),
-                    ("livestream", "session_title"),
-                ),
+            },
+            validate.transform(
+                lambda data: {
+                   "source": data["source"],
+                   "author": data["livestream"]["channel"]["user"]["username"],
+                   "title": data["livestream"]["session_title"],
+                   "createdAt": data["livestream"]["created_at"],
+                }
             ),
         )
+        res_text = self._just_query(self._URL_API_VOD.format(vod=self.id))
+        res_json = parse_json(res_text)
+        self.metadata = self._just_schema(res_json, schema)
 
+        hls_url = self.metadata["source"]
+        self.author = self.metadata["author"]
+        self.title = self.metadata["title"]
         return HLSStream.parse_variant_playlist(self.session, hls_url)
 
     def _get_streams_clip(self):
@@ -366,6 +393,13 @@ class Kick(Plugin):
             return self._get_streams_vod()
         if self.matches["clip"]:
             return self._get_streams_clip()
+        raise TypeError(f"Invalid stream type {self.matches}")
+
+    def get_metadata(self) -> dict:
+        smeta: dict = super().get_metadata()
+        data = smeta | self.metadata
+        return data
+
 
 
 __plugin__ = Kick
